@@ -3,3 +3,5 @@ Dist TransE:
 Main file where changes have been added is 'Config.py'(in config folder).  
 To run train phase execute 'example_train_transe.py'.  
 #epochs are set using con.set_train_times(100) in 'example_train_transe.py'. Change the argument accordingly. To suppress loss output at each step: con.set_log_on(0)  
+Issue:  
+Upon logging device placement, only gpu:0 is allotted and allgather happens on cpu
