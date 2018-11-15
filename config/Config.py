@@ -51,14 +51,16 @@ class Config(object):
 			self.lib.setInPath(ctypes.create_string_buffer(self.in_path.encode(), len(self.in_path) * 2))
 			self.lib.setBern(self.bern)
 			self.lib.setWorkThreads(self.workThreads)
-			self.lib.randReset()
+			self.lib.randReset(hvd.rank())
+			self.lib.setSize(hvd.size())
+			self.lib.setRank(hvd.rank())
 			self.lib.importTrainFiles()
 			self.relTotal = self.lib.getRelationTotal()
 			self.entTotal = self.lib.getEntityTotal()
 			self.trainTotal = self.lib.getTrainTotal()
 			self.testTotal = self.lib.getTestTotal()
 			self.validTotal = self.lib.getValidTotal()
-			self.batch_size = int(self.lib.getTrainTotal() / self.nbatches)
+			self.batch_size = int(self.lib.getTrainTotal() / (self.nbatches * hvd.size()))
 			self.batch_seq_size = self.batch_size * (1 + self.negative_ent + self.negative_rel)
 			self.batch_h = np.zeros(self.batch_size * (1 + self.negative_ent + self.negative_rel), dtype = np.int64)
 			self.batch_t = np.zeros(self.batch_size * (1 + self.negative_ent + self.negative_rel), dtype = np.int64)
@@ -135,7 +137,7 @@ class Config(object):
 		self.alpha = alpha
 
 	def set_in_path(self, path):
-		self.in_path = path
+		self.in_path = path#[:-1] + "-" + str(hvd.rank()) + "/"
 
 	def set_out_files(self, path):
 		self.out_path = path
@@ -156,10 +158,10 @@ class Config(object):
 
 	#Horovod added: Reduced the number of epochs
 	def set_train_times(self, times):
-		self.train_times = times // hvd.size()
+		self.train_times = times
 
 	def set_nbatches(self, nbatches):
-		self.nbatches = nbatches
+		self.nbatches = nbatches // hvd.size()
 
 	def set_margin(self, margin):
 		self.margin = margin
@@ -256,7 +258,7 @@ class Config(object):
 		self.graph = tf.Graph()
 		with self.graph.as_default():
 			#Horovod added: Normal workflow
-			config1 = tf.ConfigProto()
+			config1 = tf.ConfigProto(log_device_placement=False)
 			config1.gpu_options.allow_growth = True
 			config1.gpu_options.visible_device_list = str(hvd.local_rank())
 			self.sess = tf.Session(config=config1)
@@ -278,8 +280,9 @@ class Config(object):
 						self.optimizer = tf.train.GradientDescentOptimizer(self.alpha * hvd.size())
 					self.optimizer = hvd.DistributedOptimizer(self.optimizer)
 					self.train_op = self.optimizer.minimize(self.trainModel.loss)
-				#Horovod end
-				self.saver = tf.train.Saver()
+					#Horovod end
+				if(hvd.rank() == 0):
+					self.saver = tf.train.Saver()
 				self.sess.run(tf.initialize_all_variables())
 				
 				#Horovod added: Normal workflow
@@ -310,17 +313,21 @@ class Config(object):
 			with self.sess.as_default():
 				if self.importName != None:
 					self.restore_tensorflow()
+				if(hvd.rank() == 0):
+					start = time.time()
 				for times in range(self.train_times):
 					res = 0.0
 					for batch in range(self.nbatches):
 						self.sampling()
 						res += self.train_step(self.batch_h, self.batch_t, self.batch_r, self.batch_y)
 					if self.log_on:
-						if(hvd.rank() == 0):
-							print(times)
-							print(res)
+						#print(times)
+						print("Epoch: {} , nbatches = {}".format(times, self.nbatches))
+						print(res/self.nbatches)
 					if self.exportName != None and (self.export_steps!=0 and times % self.export_steps == 0):
 						self.save_tensorflow()
+				if(hvd.rank() == 0):
+					print("Time taken: {0}".format(time.time() - start))
 				if self.exportName != None:
 					if(hvd.rank() == 0):
 						self.save_tensorflow()
@@ -329,33 +336,37 @@ class Config(object):
 						self.save_parameters(self.out_path)
 
 	def test(self):
-		with self.graph.as_default():
-			with self.sess.as_default():
-				if self.importName != None:
-					self.restore_tensorflow()
-				if self.test_link_prediction:
-					total = self.lib.getTestTotal()
-					for times in range(total):
-						self.lib.getHeadBatch(self.test_h_addr, self.test_t_addr, self.test_r_addr)
-						res = self.test_step(self.test_h, self.test_t, self.test_r)
-						self.lib.testHead(res.__array_interface__['data'][0])
+		if(hvd.rank() == 0):
+			with self.graph.as_default():
+				with self.sess.as_default():
+					if self.importName != None:
+						self.restore_tensorflow()
+					if self.test_link_prediction:
+						total = self.lib.getTestTotal()
+						for times in range(total):
+							self.lib.getHeadBatch(self.test_h_addr, self.test_t_addr, self.test_r_addr)
+							res = self.test_step(self.test_h, self.test_t, self.test_r)
+							self.lib.testHead(res.__array_interface__['data'][0])
 
-						self.lib.getTailBatch(self.test_h_addr, self.test_t_addr, self.test_r_addr)
-						res = self.test_step(self.test_h, self.test_t, self.test_r)
-						self.lib.testTail(res.__array_interface__['data'][0])
-						if self.log_on:
-							print(times)
-					self.lib.test_link_prediction()
-				if self.test_triple_classification:
-					self.lib.getValidBatch(self.valid_pos_h_addr, self.valid_pos_t_addr, self.valid_pos_r_addr, self.valid_neg_h_addr, self.valid_neg_t_addr, self.valid_neg_r_addr)
-					res_pos = self.test_step(self.valid_pos_h, self.valid_pos_t, self.valid_pos_r)
-					res_neg = self.test_step(self.valid_neg_h, self.valid_neg_t, self.valid_neg_r)
-					self.lib.getBestThreshold(res_pos.__array_interface__['data'][0], res_neg.__array_interface__['data'][0])
+							self.lib.getTailBatch(self.test_h_addr, self.test_t_addr, self.test_r_addr)
+							res = self.test_step(self.test_h, self.test_t, self.test_r)
+							self.lib.testTail(res.__array_interface__['data'][0])
+							if self.log_on:
+								print(times)
+						self.lib.test_link_prediction()
+					if self.test_triple_classification:
+						self.lib.getValidBatch(self.valid_pos_h_addr, self.valid_pos_t_addr, self.valid_pos_r_addr, self.valid_neg_h_addr, self.valid_neg_t_addr, self.valid_neg_r_addr)
+						res_pos = self.test_step(self.valid_pos_h, self.valid_pos_t, self.valid_pos_r)
+						res_neg = self.test_step(self.valid_neg_h, self.valid_neg_t, self.valid_neg_r)
+						self.lib.getBestThreshold(res_pos.__array_interface__['data'][0], res_neg.__array_interface__['data'][0])
 
-					self.lib.getTestBatch(self.test_pos_h_addr, self.test_pos_t_addr, self.test_pos_r_addr, self.test_neg_h_addr, self.test_neg_t_addr, self.test_neg_r_addr)
+						self.lib.getTestBatch(self.test_pos_h_addr, self.test_pos_t_addr, self.test_pos_r_addr, self.test_neg_h_addr, self.test_neg_t_addr, self.test_neg_r_addr)
 
-					res_pos = self.test_step(self.test_pos_h, self.test_pos_t, self.test_pos_r)
-					res_neg = self.test_step(self.test_neg_h, self.test_neg_t, self.test_neg_r)
-					self.lib.test_triple_classification(res_pos.__array_interface__['data'][0], res_neg.__array_interface__['data'][0])
+						res_pos = self.test_step(self.test_pos_h, self.test_pos_t, self.test_pos_r)
+						res_neg = self.test_step(self.test_neg_h, self.test_neg_t, self.test_neg_r)
+						self.lib.test_triple_classification(res_pos.__array_interface__['data'][0], res_neg.__array_interface__['data'][0])
+		else:
+			pass
+
 
 
