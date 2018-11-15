@@ -22,7 +22,7 @@ INT corrupt_head(INT id, INT h, INT r) {
 		rig = mid;
 	}
 	rr = lef;
-	INT tmp = rand_max(id, entityTotal - (rr - ll + 1));
+	INT tmp = rand_max(id, entityTotal - (rr - ll + 1), 1, 0);
 	if (tmp < trainHead[ll].t) return tmp;
 	if (tmp > trainHead[rr].t - rr + ll - 1) return tmp + rr - ll + 1;
 	lef = ll, rig = rr + 1;
@@ -54,7 +54,7 @@ INT corrupt_tail(INT id, INT t, INT r) {
 		rig = mid;
 	}
 	rr = lef;
-	INT tmp = rand_max(id, entityTotal - (rr - ll + 1));
+	INT tmp = rand_max(id, entityTotal - (rr - ll + 1), 1, 0);
 	if (tmp < trainTail[ll].h) return tmp;
 	if (tmp > trainTail[rr].h - rr + ll - 1) return tmp + rr - ll + 1;
 	lef = ll, rig = rr + 1;
@@ -87,7 +87,7 @@ INT corrupt_rel(INT id, INT h, INT t) {
 		rig = mid;
 	}
 	rr = lef;
-	INT tmp = rand_max(id, relationTotal - (rr - ll + 1));
+	INT tmp = rand_max(id, relationTotal - (rr - ll + 1), 1, 0);
 	if (tmp < trainRel[ll].r) return tmp;
 	if (tmp > trainRel[rr].r - rr + ll - 1) return tmp + rr - ll + 1;
 	lef = ll, rig = rr + 1;

@@ -19,7 +19,19 @@ extern "C"
 void setBern(INT con);
 
 extern "C"
+void setSize(INT hsize);
+
+extern "C"
+void setRank(INT hrank);
+
+extern "C"
 INT getWorkThreads();
+
+extern "C"
+INT getSize();
+
+extern "C"
+INT getRank();
 
 extern "C"
 INT getEntityTotal();
@@ -40,7 +52,7 @@ extern "C"
 INT getValidTotal();
 
 extern "C"
-void randReset();
+void randReset(INT rank);
 
 extern "C"
 void importTrainFiles();
@@ -77,7 +89,7 @@ void* getBatch(void* con) {
 	}
 	REAL prob = 500;
 	for (INT batch = lef; batch < rig; batch++) {
-		INT i = rand_max(id, trainTotal);
+		INT i = rand_max(id, trainTotal, size, rank);
 		batch_h[batch] = trainList[i].h;
 		batch_t[batch] = trainList[i].t;
 		batch_r[batch] = trainList[i].r;

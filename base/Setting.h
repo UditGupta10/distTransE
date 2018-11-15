@@ -31,6 +31,33 @@ void setOutPath(char *path) {
 ============================================================
 */
 
+INT size = 1;
+INT rank = 0;
+
+extern "C"
+void setSize(INT hsize){
+	size = hsize;
+}
+
+extern "C"
+void setRank(INT hrank){
+	rank = hrank;
+}
+
+extern "C"
+INT getSize(){
+	return size;
+}
+
+extern "C"
+INT getRank(){
+	return rank;
+}
+
+/*
+============================================================
+*/
+
 INT workThreads = 1;
 
 extern "C"

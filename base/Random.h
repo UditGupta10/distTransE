@@ -6,8 +6,9 @@
 unsigned long long *next_random;
 
 extern "C"
-void randReset() {
+void randReset(INT rank) {
 	next_random = (unsigned long long *)calloc(workThreads, sizeof(unsigned long long));
+	srand(rank+1);
 	for (INT i = 0; i < workThreads; i++)
 		next_random[i] = rand();
 }
@@ -17,11 +18,22 @@ unsigned long long randd(INT id) {
 	return next_random[id];
 }
 
-INT rand_max(INT id, INT x) {
-	INT res = randd(id) % x;
-	while (res < 0)
-		res += x;
-	return res;
+INT rand_max(INT id, INT x, INT size, INT rank) {
+	INT part = x / size ;
+	INT a = part * rank;
+	INT b = part * (rank+1);
+	if(rank != size - 1){
+		INT res = (randd(id) % (b-a)) + a;
+		while (res < a)
+			res += (b-a);
+		return res;
+	}
+	else{
+		INT res = (randd(id) % (x-a)) + a;
+		while (res < a)
+			res += (x-a);
+		return res;
+	}
 }
 
 //[a,b)
