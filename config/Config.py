@@ -388,7 +388,11 @@ class Config(object):
 			averaged_gradients = []
 			with tf.name_scope("Allreduce"):
 				for (accumulator, (grad, var)) in zip(self.accumulators, self.grad_pairs):
-					#if tf.equal(accumulator, 0)
+					#if tf.equal(accumulator, 0)					
+					# Todo :: we have to figure out how to perform this
+					# cnz_worker = count_non_zero(accumulator) in each worker
+					# cnz_global = hvd.allreduce(cnz_worker)
+					# if cnz_global > 0
 					if accumulator is not None:
 						avg_grad = hvd.allreduce(accumulator / self.accumulation_counter)
 						averaged_gradients.append((avg_grad, var))
