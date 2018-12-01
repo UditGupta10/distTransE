@@ -1,12 +1,15 @@
 #coding:utf-8
 import numpy as np
+import matplotlib.pyplot as plt
 import tensorflow as tf
 import os
 import time
 import datetime
 import ctypes
 import json
+import pickle
 import horovod.tensorflow as hvd
+
 hvd.init()
 class Config(object):
 
@@ -45,27 +48,36 @@ class Config(object):
 		self.optimizer = None
 		self.test_link_prediction = False
 		self.test_triple_classification = False
+		########
+		self.sync_after = 1
+		self.plot_train_loss = False
+		########/////
 	def init(self):
 		self.trainModel = None
+		self.track_loss = []
 		if self.in_path != None:
 			self.lib.setInPath(ctypes.create_string_buffer(self.in_path.encode(), len(self.in_path) * 2))
 			self.lib.setBern(self.bern)
 			self.lib.setWorkThreads(self.workThreads)
-			self.lib.randReset(hvd.rank())
-			self.lib.setSize(hvd.size())
-			self.lib.setRank(hvd.rank())
+			self.lib.randReset(0)
 			self.lib.importTrainFiles()
 			self.relTotal = self.lib.getRelationTotal()
 			self.entTotal = self.lib.getEntityTotal()
 			self.trainTotal = self.lib.getTrainTotal()
 			self.testTotal = self.lib.getTestTotal()
 			self.validTotal = self.lib.getValidTotal()
-			self.batch_size = int(self.lib.getTrainTotal() / (self.nbatches * hvd.size()))
+			self.batch_size = int(self.lib.getTrainTotal() / (self.nbatches * hvd.size() * 1.0))
+			###########
+			self.allreduce_batch_size = self.batch_size * self.sync_after
+			self.allreduce_nbatches = int(self.nbatches / (self.sync_after * 1.0))
+			############/////
 			self.batch_seq_size = self.batch_size * (1 + self.negative_ent + self.negative_rel)
-			self.batch_h = np.zeros(self.batch_size * (1 + self.negative_ent + self.negative_rel), dtype = np.int64)
-			self.batch_t = np.zeros(self.batch_size * (1 + self.negative_ent + self.negative_rel), dtype = np.int64)
-			self.batch_r = np.zeros(self.batch_size * (1 + self.negative_ent + self.negative_rel), dtype = np.int64)
-			self.batch_y = np.zeros(self.batch_size * (1 + self.negative_ent + self.negative_rel), dtype = np.float32)
+			####################
+			self.batch_h = np.zeros(self.allreduce_batch_size * (1 + self.negative_ent + self.negative_rel), dtype = np.int64)
+			self.batch_t = np.zeros(self.allreduce_batch_size * (1 + self.negative_ent + self.negative_rel), dtype = np.int64)
+			self.batch_r = np.zeros(self.allreduce_batch_size * (1 + self.negative_ent + self.negative_rel), dtype = np.int64)
+			self.batch_y = np.zeros(self.allreduce_batch_size * (1 + self.negative_ent + self.negative_rel), dtype = np.float32)
+			###################//////
 			self.batch_h_addr = self.batch_h.__array_interface__['data'][0]
 			self.batch_t_addr = self.batch_t.__array_interface__['data'][0]
 			self.batch_r_addr = self.batch_r.__array_interface__['data'][0]
@@ -114,6 +126,12 @@ class Config(object):
 
 	def get_rel_total(self):
 		return self.relTotal
+
+	def set_sync_after(self, x):
+		self.sync_after = x
+
+	def set_plot_train_loss(self, flag):
+		self.plot_train_loss = flag
 
 	def set_lmbda(self, lmbda):
 		self.lmbda = lmbda
@@ -185,8 +203,10 @@ class Config(object):
 	def set_export_steps(self, steps):
 		self.export_steps = steps
 
+	########################	
 	def sampling(self):
-		self.lib.sampling(self.batch_h_addr, self.batch_t_addr, self.batch_r_addr, self.batch_y_addr, self.batch_size, self.negative_ent, self.negative_rel)
+		self.lib.sampling(self.batch_h_addr, self.batch_t_addr, self.batch_r_addr, self.batch_y_addr, self.allreduce_batch_size, self.negative_ent, self.negative_rel)
+	#########################//////////////
 
 	def save_tensorflow(self):
 		with self.graph.as_default():
@@ -277,27 +297,135 @@ class Config(object):
 					elif self.opt_method == "Adam" or self.opt_method == "adam":
 						self.optimizer = tf.train.AdamOptimizer(self.alpha * hvd.size())
 					else:
-						self.optimizer = tf.train.GradientDescentOptimizer(self.alpha * hvd.size())
-					self.optimizer = hvd.DistributedOptimizer(self.optimizer)
-					self.train_op = self.optimizer.minimize(self.trainModel.loss)
+						self.optimizer = tf.train.GradientDescentOptimizer(self.alpha * hvd.size() * self.sync_after)
+
+					################################################################
+					# Fetch a list of our network's trainable parameters.
+					self.trainable_vars = tf.trainable_variables()
+					#print("Shape of trainable vars: {}".format(np.array(self.trainable_vars)))
+
+					# Create variables to store accumulated gradients
+					self.accumulators = [
+					    tf.Variable(
+					        tf.zeros_like(tv.initialized_value()),
+					        trainable=False
+					    ) for tv in self.trainable_vars
+					]
+					#print("Shape of accumulators: {}".format(np.array(self.accumulators)))
+
+					# Create a variable for counting the number of accumulations
+					self.accumulation_counter = tf.Variable(0.0, trainable=False)
+
+					# Compute gradients; grad_pairs contains (gradient, variable) pairs
+					self.grad_pairs = self.optimizer.compute_gradients(self.trainModel.loss, self.trainable_vars)
+					# print("Shape of grad_pairs: {}".format(np.array(self.grad_pairs)))
+					# for g, v in self.grad_pairs:
+					# 	print("Shape of grad: {}".format(np.array(g)))
+
+
+					# Create operations which add a variable's gradient to its accumulator.
+					self.accumulate_ops = [
+					    accumulator.assign_add(
+					        grad
+					    ) for (accumulator, (grad, var)) in zip(self.accumulators, self.grad_pairs) #if grad is not None
+					]
+
+					# The final accumulation operation is to increment the counter
+					self.accumulate_ops.append(self.accumulation_counter.assign_add(1.0))
+
+					# Update trainable variables by applying the accumulated gradients
+					# divided by the counter. Note: apply_gradients takes in a list of 
+					# (grad, var) pairs
+					# self.apply_step = self.optimizer.apply_gradients(
+					#     [(accumulator / self.accumulation_counter, var) \
+					#         for (accumulator, (grad, var)) in zip(self.accumulators, self.grad_pairs)]
+					# )
+
+					# Accumulators must be zeroed once the accumulated gradient is applied.
+					self.zero_ops = [
+					    accumulator.assign(
+					        tf.zeros_like(tv)
+					    ) for (accumulator, tv) in zip(self.accumulators, self.trainable_vars)
+					]
+
+					# Add one last op for zeroing the counter
+					self.zero_ops.append(self.accumulation_counter.assign(0.0))
+					################################################################///////////
+
+
+
+					# self.dist_optimizer = hvd.DistributedOptimizer(self.optimizer)
+					# self.train_op = self.dist_optimizer.minimize(self.trainModel.loss)
 					#Horovod end
+				self.barrier = hvd.allreduce(tf.random_normal(shape=[1]))
 				if(hvd.rank() == 0):
 					self.saver = tf.train.Saver()
-				self.sess.run(tf.initialize_all_variables())
+					# self.logSummary = tf.summary.scalar('Train_loss', self.trainModel.loss)
+					# self.train_writer = tf.summary.FileWriter('./train', self.sess.graph)
+				self.sess.run(tf.global_variables_initializer())
 				
 				#Horovod added: Normal workflow
 				self.sess.run(hvd.broadcast_global_variables(0))
 				#Horovod end
 
-	def train_step(self, batch_h, batch_t, batch_r, batch_y):
-		feed_dict = {
-			self.trainModel.batch_h: batch_h,
-			self.trainModel.batch_t: batch_t,
-			self.trainModel.batch_r: batch_r,
-			self.trainModel.batch_y: batch_y
-		}
-		_, loss = self.sess.run([self.train_op, self.trainModel.loss], feed_dict)
-		return loss
+	def train_step(self, batch_h, batch_t, batch_r, batch_y, counter):
+		self.sess.run(self.zero_ops)
+		allreduce_loss = 0.0
+		for i in range(self.sync_after):
+			feed_dict = {
+				self.trainModel.batch_h: np.append(batch_h[i*self.batch_size : (i+1)*self.batch_size], batch_h[self.allreduce_batch_size + i*self.batch_size : self.allreduce_batch_size + (i+1)*self.batch_size]),
+				self.trainModel.batch_t: np.append(batch_t[i*self.batch_size : (i+1)*self.batch_size], batch_t[self.allreduce_batch_size + i*self.batch_size : self.allreduce_batch_size + (i+1)*self.batch_size]),
+				self.trainModel.batch_r: np.append(batch_r[i*self.batch_size : (i+1)*self.batch_size], batch_r[self.allreduce_batch_size + i*self.batch_size : self.allreduce_batch_size + (i+1)*self.batch_size]),
+				self.trainModel.batch_y: np.append(batch_y[i*self.batch_size : (i+1)*self.batch_size], batch_y[self.allreduce_batch_size + i*self.batch_size : self.allreduce_batch_size + (i+1)*self.batch_size])
+			}
+			_, c = self.sess.run([self.accumulate_ops, self.trainModel.loss], feed_dict = feed_dict)
+			allreduce_loss += c
+		self.track_loss.append((counter, allreduce_loss))
+		self.sess.run(self.barrier)
+		st1 = time.time()
+
+		if hvd.size() > 1:
+			averaged_gradients = []
+			with tf.name_scope("Allreduce"):
+				for (accumulator, (grad, var)) in zip(self.accumulators, self.grad_pairs):
+					#if tf.equal(accumulator, 0)
+					if accumulator is not None:
+						avg_grad = hvd.allreduce(accumulator / self.accumulation_counter)
+						averaged_gradients.append((avg_grad, var))
+					else:
+						averaged_gradients.append((None, var))
+		else:
+			averaged_gradients = []
+			with tf.name_scope("Allreduce"):
+				for (accumulator, (grad, var)) in zip(self.accumulators, self.grad_pairs):
+					#print("Shape of accumulator: {}".format(np.array(accumulator)))
+					if accumulator is not None:						
+						avg_grad = accumulator / self.accumulation_counter
+						averaged_gradients.append((avg_grad, var))
+					else:
+						averaged_gradients.append((None, var))
+
+
+		if(counter%200 == 0):
+			print('Averaging gradients for 200 batches took: {} secs'.format(time.time() - st1))
+
+		st2 = time.time()
+		self.sess.run(self.optimizer.apply_gradients(averaged_gradients))
+
+		if(counter%200 == 0):
+			print('Applying gradients for 200 batches took: {} secs'.format(time.time() - st2))
+
+		return allreduce_loss
+
+
+
+
+
+
+
+
+
+
 
 	def test_step(self, test_h, test_t, test_r):
 		feed_dict = {
@@ -315,19 +443,28 @@ class Config(object):
 					self.restore_tensorflow()
 				if(hvd.rank() == 0):
 					start = time.time()
+				counter = 0
 				for times in range(self.train_times):
 					res = 0.0
-					for batch in range(self.nbatches):
+					for batch in range(self.allreduce_nbatches):
+						counter += 1
 						self.sampling()
-						res += self.train_step(self.batch_h, self.batch_t, self.batch_r, self.batch_y)
+						res += self.train_step(self.batch_h, self.batch_t, self.batch_r, self.batch_y, counter)
+					if(hvd.rank() == 0):
+						print("Time taken: {0}".format(time.time() - start))
 					if self.log_on:
 						#print(times)
-						print("Epoch: {} , nbatches = {}".format(times, self.nbatches))
-						print(res/self.nbatches)
+						print("Epoch: {} , nbatches = {}".format(times, self.allreduce_nbatches))
+						print(res/self.allreduce_nbatches)
 					if self.exportName != None and (self.export_steps!=0 and times % self.export_steps == 0):
 						self.save_tensorflow()
 				if(hvd.rank() == 0):
 					print("Time taken: {0}".format(time.time() - start))
+					if self.plot_train_loss:
+						with open('./plot_loss/acc_1024/' + str(hvd.size()) + 'p-' + str(self.sync_after) + 'sa' + '.pkl', 'wb') as f:
+							pickle.dump(self.track_loss, f)
+					# plt.plot(*zip(*self.track_loss))
+					# plt.show()
 				if self.exportName != None:
 					if(hvd.rank() == 0):
 						self.save_tensorflow()
@@ -336,37 +473,38 @@ class Config(object):
 						self.save_parameters(self.out_path)
 
 	def test(self):
-		if(hvd.rank() == 0):
-			with self.graph.as_default():
-				with self.sess.as_default():
-					if self.importName != None:
-						self.restore_tensorflow()
-					if self.test_link_prediction:
-						total = self.lib.getTestTotal()
-						for times in range(total):
-							self.lib.getHeadBatch(self.test_h_addr, self.test_t_addr, self.test_r_addr)
-							res = self.test_step(self.test_h, self.test_t, self.test_r)
-							self.lib.testHead(res.__array_interface__['data'][0])
+		with self.graph.as_default():
+			with self.sess.as_default():
+				if self.importName != None:
+					self.restore_tensorflow()
+				if self.test_link_prediction:
+					total = self.lib.getTestTotal()
+					x = 0.0
+					for times in range(total):
+						self.lib.getHeadBatch(self.test_h_addr, self.test_t_addr, self.test_r_addr)
+						res = self.test_step(self.test_h, self.test_t, self.test_r)
+						self.lib.testHead(res.__array_interface__['data'][0])
 
-							self.lib.getTailBatch(self.test_h_addr, self.test_t_addr, self.test_r_addr)
-							res = self.test_step(self.test_h, self.test_t, self.test_r)
-							self.lib.testTail(res.__array_interface__['data'][0])
-							if self.log_on:
-								print(times)
+						self.lib.getTailBatch(self.test_h_addr, self.test_t_addr, self.test_r_addr)
+						res = self.test_step(self.test_h, self.test_t, self.test_r)
+						self.lib.testTail(res.__array_interface__['data'][0])
+						if self.log_on and hvd.rank() == 0:
+							if(times == int(total*x)):
+								print('Testing progress: ' + str(x*100) + '%')
+								x+=0.1
+					if(hvd.rank() == 0):
 						self.lib.test_link_prediction()
-					if self.test_triple_classification:
-						self.lib.getValidBatch(self.valid_pos_h_addr, self.valid_pos_t_addr, self.valid_pos_r_addr, self.valid_neg_h_addr, self.valid_neg_t_addr, self.valid_neg_r_addr)
-						res_pos = self.test_step(self.valid_pos_h, self.valid_pos_t, self.valid_pos_r)
-						res_neg = self.test_step(self.valid_neg_h, self.valid_neg_t, self.valid_neg_r)
-						self.lib.getBestThreshold(res_pos.__array_interface__['data'][0], res_neg.__array_interface__['data'][0])
+				if (self.test_triple_classification and hvd.rank() == 0):
+					self.lib.getValidBatch(self.valid_pos_h_addr, self.valid_pos_t_addr, self.valid_pos_r_addr, self.valid_neg_h_addr, self.valid_neg_t_addr, self.valid_neg_r_addr)
+					res_pos = self.test_step(self.valid_pos_h, self.valid_pos_t, self.valid_pos_r)
+					res_neg = self.test_step(self.valid_neg_h, self.valid_neg_t, self.valid_neg_r)
+					self.lib.getBestThreshold(res_pos.__array_interface__['data'][0], res_neg.__array_interface__['data'][0])
 
-						self.lib.getTestBatch(self.test_pos_h_addr, self.test_pos_t_addr, self.test_pos_r_addr, self.test_neg_h_addr, self.test_neg_t_addr, self.test_neg_r_addr)
+					self.lib.getTestBatch(self.test_pos_h_addr, self.test_pos_t_addr, self.test_pos_r_addr, self.test_neg_h_addr, self.test_neg_t_addr, self.test_neg_r_addr)
 
-						res_pos = self.test_step(self.test_pos_h, self.test_pos_t, self.test_pos_r)
-						res_neg = self.test_step(self.test_neg_h, self.test_neg_t, self.test_neg_r)
-						self.lib.test_triple_classification(res_pos.__array_interface__['data'][0], res_neg.__array_interface__['data'][0])
-		else:
-			pass
+					res_pos = self.test_step(self.test_pos_h, self.test_pos_t, self.test_pos_r)
+					res_neg = self.test_step(self.test_neg_h, self.test_neg_t, self.test_neg_r)
+					self.lib.test_triple_classification(res_pos.__array_interface__['data'][0], res_neg.__array_interface__['data'][0])
 
 
 
